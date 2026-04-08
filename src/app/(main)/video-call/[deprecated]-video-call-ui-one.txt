@@ -1,0 +1,654 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useEffect, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import io, { Socket } from 'socket.io-client'
+import { api } from '@/lib/api/axios'
+
+interface VideoCallWithBookingProps {
+  bookingId: number
+  userType: 'patient' | 'doctor'
+}
+
+const VideoCallWithBooking_Pending = ({ bookingId, userType }: VideoCallWithBookingProps) => {
+  const router = useRouter()
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map())
+  const [isCallActive, setIsCallActive] = useState(false)
+  const [isMuted, setIsMuted] = useState(false)
+  const [isVideoOff, setIsVideoOff] = useState(false)
+  const [roomId, setRoomId] = useState<string | null>(null)
+  const [bookingStatus, setBookingStatus] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [participants, setParticipants] = useState<string[]>([])
+  const [debugLogs, setDebugLogs] = useState<string[]>([])
+
+  const localVideoRef = useRef<HTMLVideoElement>(null)
+  const remoteVideosRef = useRef<Map<string, HTMLVideoElement>>(new Map())
+  const socketRef = useRef<Socket | null>(null)
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const hasInitializedRef = useRef(false) // Prevent double-fetch in strict mode
+
+  const iceServers = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ],
+  }
+
+  // Add debug log
+  const addLog = (message: string) => {
+    setDebugLogs((prev) => [...prev.slice(-5), `${new Date().toLocaleTimeString()}: ${message}`])
+    console.log(message)
+  }
+
+  // STEP 1: Fetch room info on mount (ONLY ONCE)
+  useEffect(() => {
+    // Prevent double initialization in React Strict Mode
+    if (hasInitializedRef.current) {
+      addLog('⚠️ Initialization already in progress, skipping duplicate')
+      return
+    }
+    hasInitializedRef.current = true
+
+    console.log(userType, 'this is the userType')
+    const fetchRoomInfo = async () => {
+      try {
+        addLog('🔍 Fetching room info...')
+
+        const response = await api.post(`/booking/${bookingId}/video/generate`, {
+          userType: userType.toUpperCase(),
+        })
+
+        const { roomId: fetchedRoomId, booking } = response.data?.data
+
+        addLog(`✅ Got roomId: ${fetchedRoomId}`)
+        addLog(`📋 Booking status: ${booking.status}`)
+
+        setRoomId(fetchedRoomId)
+        setBookingStatus(booking.status)
+
+        // If booking is cancelled or completed, redirect
+        if (booking.status === 'CANCELLED' || booking.status === 'COMPLETED') {
+          addLog('⚠️ Booking not active, redirecting...')
+          router.push('/appointments')
+          return
+        }
+
+        // If call is already in progress, auto-join
+        if (booking.status === 'IN_PROGRESS') {
+          addLog('🚀 Call in progress, auto-joining...')
+          await startCall(fetchedRoomId)
+        }
+
+        setIsLoading(false)
+      } catch (error: any) {
+        addLog(`❌ Error fetching room: ${error.message}`)
+        setIsLoading(false)
+      }
+    }
+
+    fetchRoomInfo()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Initialize Socket.IO
+  useEffect(() => {
+    socketRef.current = io(process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:5000')
+
+    socketRef.current.on('connect', () => {
+      addLog(`✅ Socket connected: ${socketRef.current?.id}`)
+    })
+
+    // Meeting created
+    socketRef.current.on(
+      'meeting:created',
+      (data: { meetingId: string; participants: string[] }) => {
+        addLog(`✅ Meeting created: ${data.meetingId}`)
+        setParticipants(data.participants)
+      },
+    )
+
+    // Meeting joined
+    socketRef.current.on(
+      'meeting:joined',
+      async (data: { meetingId: string; existingParticipants: string[] }) => {
+        addLog(`✅ Joined meeting: ${data.meetingId}`)
+        addLog(`👥 Existing participants: ${data.existingParticipants.length}`)
+
+        if (data.existingParticipants.length === 0) {
+          addLog(`⚠️ You are the FIRST person in this room`)
+          addLog(`⏳ Waiting for others to join...`)
+        }
+
+        // Create peer connections for all existing participants
+        for (const participantId of data.existingParticipants) {
+          addLog(`🔗 Creating peer for: ${participantId.slice(0, 8)}...`)
+          await createPeerConnection(participantId, true)
+        }
+      },
+    )
+
+    // New participant joined
+    socketRef.current.on(
+      'meeting:participant-joined',
+      async (data: { userId: string; participants: string[] }) => {
+        addLog(`👤 New participant: ${data.userId.slice(0, 8)}...`)
+        setParticipants(data.participants)
+
+        // CREATE PEER CONNECTION
+        await createPeerConnection(data.userId, true)
+      },
+    )
+
+    // Participant left
+    socketRef.current.on(
+      'meeting:participant-left',
+      (data: { userId: string; participants: string[] }) => {
+        addLog(`❌ Participant left: ${data.userId.slice(0, 8)}...`)
+        setParticipants(data.participants)
+
+        // Clean up peer connection
+        const pc = peerConnectionsRef.current.get(data.userId)
+        if (pc) {
+          pc.close()
+          peerConnectionsRef.current.delete(data.userId)
+        }
+
+        // Remove remote stream
+        setRemoteStreams((prev) => {
+          const newStreams = new Map(prev)
+          newStreams.delete(data.userId)
+          return newStreams
+        })
+      },
+    )
+
+    // WebRTC Offer received
+    socketRef.current.on(
+      'webrtc:offer',
+      async (data: { fromUserId: string; offer: RTCSessionDescriptionInit }) => {
+        addLog(`📨 Received OFFER from: ${data.fromUserId.slice(0, 8)}...`)
+        await handleOffer(data.fromUserId, data.offer)
+      },
+    )
+
+    // WebRTC Answer received
+    socketRef.current.on(
+      'webrtc:answer',
+      async (data: { fromUserId: string; answer: RTCSessionDescriptionInit }) => {
+        addLog(`📨 Received ANSWER from: ${data.fromUserId.slice(0, 8)}...`)
+        const pc = peerConnectionsRef.current.get(data.fromUserId)
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer))
+        }
+      },
+    )
+
+    // ICE Candidate received
+    socketRef.current.on(
+      'webrtc:ice-candidate',
+      async (data: { fromUserId: string; candidate: RTCIceCandidateInit }) => {
+        const pc = peerConnectionsRef.current.get(data.fromUserId)
+        if (pc && pc.remoteDescription) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate))
+            addLog(`✅ ICE candidate added from ${data.fromUserId.slice(0, 8)}`)
+          } catch (err: any) {
+            addLog(`⚠️ Error adding ICE candidate: ${err.message}`)
+          }
+        } else {
+          addLog(
+            `⚠️ Cannot add ICE candidate - no peer connection or remote description for ${data.fromUserId.slice(
+              0,
+              8,
+            )}`,
+          )
+        }
+      },
+    )
+
+    return () => {
+      socketRef.current?.disconnect()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Attach local stream to video
+  useEffect(() => {
+    if (localStream && localVideoRef.current) {
+      localVideoRef.current.srcObject = localStream
+      addLog('✅ Local video attached')
+    }
+  }, [localStream])
+
+  // Create peer connection for a specific user
+  const createPeerConnection = async (userId: string, createOffer: boolean) => {
+    addLog(`🔧 Creating peer connection for ${userId.slice(0, 8)}...`)
+
+    if (!localStream) {
+      addLog('❌ ERROR: No local stream available yet!')
+      return
+    }
+
+    // Check if peer connection already exists
+    if (peerConnectionsRef.current.has(userId)) {
+      addLog(`⚠️ Peer connection already exists for ${userId.slice(0, 8)}`)
+      return
+    }
+
+    const pc = new RTCPeerConnection(iceServers)
+    peerConnectionsRef.current.set(userId, pc)
+    addLog(`✅ Peer connection created and stored`)
+
+    // Add local tracks IMMEDIATELY
+    localStream.getTracks().forEach((track) => {
+      pc.addTrack(track, localStream)
+      addLog(`📤 Added ${track.kind} track`)
+    })
+
+    // Handle connection state changes
+    pc.onconnectionstatechange = () => {
+      addLog(`🔌 Connection state: ${pc.connectionState}`)
+      if (pc.connectionState === 'failed') {
+        addLog(`❌ Connection failed to ${userId.slice(0, 8)}, retrying...`)
+      }
+    }
+
+    // Handle ICE connection state
+    pc.oniceconnectionstatechange = () => {
+      addLog(`❄️ ICE state: ${pc.iceConnectionState}`)
+    }
+
+    // Handle incoming tracks
+    pc.ontrack = (event) => {
+      addLog(`📺 GOT REMOTE TRACK from: ${userId.slice(0, 8)}... (${event.track.kind})`)
+      const remoteStream = event.streams[0]
+
+      if (remoteStream) {
+        addLog(`✅ Setting remote stream for ${userId.slice(0, 8)}`)
+        setRemoteStreams((prev) => {
+          const newStreams = new Map(prev)
+          newStreams.set(userId, remoteStream)
+          addLog(`📊 Remote streams count: ${newStreams.size}`)
+          return newStreams
+        })
+      }
+    }
+
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        addLog(`❄️ Sending ICE candidate to ${userId.slice(0, 8)}`)
+        socketRef.current?.emit('webrtc:ice-candidate', {
+          meetingId: roomId,
+          targetUserId: userId,
+          candidate: event.candidate,
+        })
+      } else {
+        addLog(`✅ ICE candidate gathering complete for ${userId.slice(0, 8)}`)
+      }
+    }
+
+    // Create offer if initiator
+    if (createOffer) {
+      try {
+        addLog(`📤 Creating OFFER for ${userId.slice(0, 8)}...`)
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true,
+        })
+        await pc.setLocalDescription(offer)
+        addLog(`✅ Local description set, sending offer...`)
+        socketRef.current?.emit('webrtc:offer', {
+          meetingId: roomId,
+          targetUserId: userId,
+          offer,
+        })
+      } catch (err: any) {
+        addLog(`❌ Error creating offer: ${err.message}`)
+      }
+    }
+  }
+
+  // Handle received offer
+  const handleOffer = async (fromUserId: string, offer: RTCSessionDescriptionInit) => {
+    try {
+      addLog(`🔧 Handling offer from ${fromUserId.slice(0, 8)}...`)
+      let pc = peerConnectionsRef.current.get(fromUserId)
+
+      if (!pc) {
+        addLog(`⚠️ No peer connection found, creating new one...`)
+        pc = new RTCPeerConnection(iceServers)
+        peerConnectionsRef.current.set(fromUserId, pc)
+        addLog(`✅ New peer connection created`)
+
+        // Add local tracks
+        if (localStream) {
+          localStream.getTracks().forEach((track) => {
+            pc!.addTrack(track, localStream)
+            addLog(`📤 Added ${track.kind} track to offer handler`)
+          })
+        } else {
+          addLog(`❌ ERROR: No local stream in handleOffer!`)
+        }
+
+        // Handle connection state
+        pc.onconnectionstatechange = () => {
+          addLog(`🔌 Connection state (from offer): ${pc?.connectionState}`)
+        }
+
+        pc.oniceconnectionstatechange = () => {
+          addLog(`❄️ ICE state (from offer): ${pc?.iceConnectionState}`)
+        }
+
+        // Handle incoming tracks
+        pc.ontrack = (event) => {
+          addLog(`📺 GOT REMOTE TRACK from: ${fromUserId.slice(0, 8)}... (${event.track.kind})`)
+          const remoteStream = event.streams[0]
+
+          if (remoteStream) {
+            addLog(`✅ Setting remote stream for ${fromUserId.slice(0, 8)}`)
+            setRemoteStreams((prev) => {
+              const newStreams = new Map(prev)
+              newStreams.set(fromUserId, remoteStream)
+              addLog(`📊 Remote streams count: ${newStreams.size}`)
+              return newStreams
+            })
+          }
+        }
+
+        // Handle ICE candidates
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            addLog(`❄️ Sending ICE candidate from handler to ${fromUserId.slice(0, 8)}`)
+            socketRef.current?.emit('webrtc:ice-candidate', {
+              meetingId: roomId,
+              targetUserId: fromUserId,
+              candidate: event.candidate,
+            })
+          }
+        }
+      }
+
+      // Set remote description (the offer)
+      await pc.setRemoteDescription(new RTCSessionDescription(offer))
+      addLog(`✅ Remote description (offer) set`)
+
+      // Create and send answer
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      addLog(`✅ Local description (answer) set`)
+
+      addLog(`📤 Sending ANSWER to ${fromUserId.slice(0, 8)}...`)
+      socketRef.current?.emit('webrtc:answer', {
+        meetingId: roomId,
+        targetUserId: fromUserId,
+        answer,
+      })
+    } catch (err: any) {
+      addLog(`❌ Error handling offer: ${err.message}`)
+    }
+  }
+
+  // Start call - Called when user clicks "Start Call" or auto-joins
+  const startCall = async (targetRoomId?: string) => {
+    try {
+      const roomToJoin = targetRoomId || roomId
+
+      if (!roomToJoin) {
+        addLog('❌ No roomId available!')
+        return
+      }
+
+      addLog('🎬 Starting call...')
+
+      // Get media first
+      addLog('📹 Requesting camera/microphone...')
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720 },
+        audio: true,
+      })
+
+      addLog(`✅ Got media stream with ${stream.getTracks().length} tracks`)
+      setLocalStream(stream)
+      setIsCallActive(true)
+
+      // Small delay to ensure state is updated
+      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      // If not already IN_PROGRESS, call the start API
+      if (bookingStatus !== 'IN_PROGRESS') {
+        addLog('📞 Calling start video call API...')
+        try {
+          await api.post(`/booking/${bookingId}/video/start`, {
+            userType: userType.toUpperCase(),
+          })
+          setBookingStatus('IN_PROGRESS')
+          addLog('✅ Booking status updated to IN_PROGRESS')
+        } catch (err: any) {
+          addLog(`⚠️ API error (non-critical): ${err.message}`)
+        }
+      }
+
+      // Join the Socket.IO room using roomId
+      addLog(`🚪 Joining room: ${roomToJoin}`)
+      socketRef.current?.emit('meeting:join', {
+        meetingId: roomToJoin,
+        userId: socketRef.current?.id,
+      })
+      addLog('✅ Join signal sent')
+    } catch (err: any) {
+      addLog('❌ Error starting call: ' + err.message)
+      setIsCallActive(false)
+    }
+  }
+
+  const toggleMute = () => {
+    if (localStream) {
+      const audioTrack = localStream.getAudioTracks()[0]
+      audioTrack.enabled = !audioTrack.enabled
+      setIsMuted(!audioTrack.enabled)
+    }
+  }
+
+  const toggleVideo = () => {
+    if (localStream) {
+      const videoTrack = localStream.getVideoTracks()[0]
+      videoTrack.enabled = !videoTrack.enabled
+      setIsVideoOff(!videoTrack.enabled)
+    }
+  }
+
+  if (isLoading) {
+    return (
+      <div className="video-call-container">
+        <div className="loading">Loading meeting room...</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="video-call-container">
+      {/* Debug Panel */}
+      <div className="debug-panel">
+        <div className="debug-header">🐛 Debug Log</div>
+        {debugLogs.map((log, i) => (
+          <div key={i} className="debug-log">
+            {log}
+          </div>
+        ))}
+        <div className="debug-stats">
+          Room: {roomId} | Status: {bookingStatus} | Remote Streams: {remoteStreams.size} |
+          Participants: {participants.length}
+        </div>
+      </div>
+
+      <div className="video-grid">
+        {/* Remote Videos */}
+        {Array.from(remoteStreams.entries()).map(([userId, stream]) => (
+          <div key={userId} className="video-box">
+            <video
+              ref={(el) => {
+                if (el) {
+                  el.srcObject = stream
+                  remoteVideosRef.current.set(userId, el)
+                }
+              }}
+              autoPlay
+              playsInline
+              className="video"
+            />
+            <div className="video-label">Remote User</div>
+          </div>
+        ))}
+
+        {/* Local Video */}
+        {isCallActive && (
+          <div className={remoteStreams.size > 0 ? 'video-box-mini' : 'video-box'}>
+            <video ref={localVideoRef} autoPlay playsInline muted className="video" />
+            <div className="video-label">You ({userType})</div>
+          </div>
+        )}
+      </div>
+
+      <div className="controls">
+        {!isCallActive ? (
+          <button onClick={() => startCall()} className="btn btn-start">
+            Start Call
+          </button>
+        ) : (
+          <>
+            <button
+              onClick={toggleMute}
+              className={`btn ${isMuted ? 'btn-danger' : 'btn-secondary'}`}
+            >
+              {isMuted ? '🔇' : '🎤'}
+            </button>
+            <button
+              onClick={toggleVideo}
+              className={`btn ${isVideoOff ? 'btn-danger' : 'btn-secondary'}`}
+            >
+              {isVideoOff ? '📹' : '📷'}
+            </button>
+          </>
+        )}
+      </div>
+
+      <style jsx>{`
+        .video-call-container {
+          width: 100%;
+          height: 100vh;
+          background: #1a1a1a;
+          display: flex;
+          flex-direction: column;
+          position: relative;
+        }
+        .loading {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          height: 100vh;
+          color: white;
+          font-size: 24px;
+        }
+        .debug-panel {
+          background: rgba(0, 0, 0, 0.9);
+          color: #0f0;
+          font-family: monospace;
+          font-size: 11px;
+          padding: 10px;
+          max-height: 150px;
+          overflow-y: auto;
+          border-bottom: 2px solid #0f0;
+        }
+        .debug-header {
+          font-weight: bold;
+          margin-bottom: 5px;
+          color: #ff0;
+        }
+        .debug-log {
+          margin: 2px 0;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .debug-stats {
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px solid #0f0;
+          color: #ff0;
+          font-weight: bold;
+          font-size: 10px;
+        }
+        .video-grid {
+          flex: 1;
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+          gap: 10px;
+          padding: 20px;
+          position: relative;
+        }
+        .video-box {
+          position: relative;
+          background: #000;
+          border-radius: 12px;
+          overflow: hidden;
+        }
+        .video-box-mini {
+          position: absolute;
+          bottom: 20px;
+          right: 20px;
+          width: 200px;
+          height: 150px;
+          background: #000;
+          border-radius: 12px;
+          overflow: hidden;
+          border: 2px solid white;
+          z-index: 10;
+        }
+        .video {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+        .video-label {
+          position: absolute;
+          bottom: 10px;
+          left: 10px;
+          background: rgba(0, 0, 0, 0.7);
+          color: white;
+          padding: 5px 10px;
+          border-radius: 5px;
+          font-size: 14px;
+        }
+        .controls {
+          padding: 20px;
+          display: flex;
+          gap: 15px;
+          justify-content: center;
+          background: rgba(0, 0, 0, 0.5);
+        }
+        .btn {
+          padding: 15px 30px;
+          border: none;
+          border-radius: 50px;
+          cursor: pointer;
+          font-size: 16px;
+          font-weight: 600;
+          color: white;
+        }
+        .btn-start {
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .btn-secondary {
+          background: rgba(255, 255, 255, 0.2);
+        }
+        .btn-danger {
+          background: #ef4444;
+        }
+      `}</style>
+    </div>
+  )
+}
+
+export default VideoCallWithBooking_Pending

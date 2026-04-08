@@ -1,0 +1,387 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useEffect, useRef, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { io, Socket } from 'socket.io-client'
+import { api } from '@/lib/api/axios'
+
+interface VideoCallWithBookingProps {
+  bookingId: number
+  userType: 'patient' | 'doctor'
+}
+
+const VideoCallWithBooking_Two = ({ bookingId, userType }: VideoCallWithBookingProps) => {
+  const router = useRouter()
+
+  // --------------------- STATES ---------------------
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map())
+  const [isCallActive, setIsCallActive] = useState(false)
+  const [isMuted, setIsMuted] = useState(false)
+  const [isVideoOff, setIsVideoOff] = useState(false)
+  const [roomId, setRoomId] = useState<string | null>(null)
+  const [bookingStatus, setBookingStatus] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [participants, setParticipants] = useState<string[]>([])
+  const [debugLogs, setDebugLogs] = useState<string[]>([])
+
+  // --------------------- REFS ---------------------
+  const localVideoRef = useRef<HTMLVideoElement>(null)
+  const remoteVideosRef = useRef<Map<string, HTMLVideoElement>>(new Map())
+  const socketRef = useRef<Socket | null>(null)
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const hasInitializedRef = useRef(false) // Prevent double init
+
+  const iceServers = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ],
+  }
+
+  // --------------------- LOGGING ---------------------
+  const addLog = (message: string) => {
+    setDebugLogs((prev) => [...prev.slice(-10), `${new Date().toLocaleTimeString()}: ${message}`])
+    console.log(`[VIDEO]: ${message}`)
+  }
+
+  // --------------------- SOCKET INIT ---------------------
+  useEffect(() => {
+    if (hasInitializedRef.current) return
+    hasInitializedRef.current = true
+
+    addLog('Initializing socket...')
+
+    socketRef.current = io(process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:5000', {
+      transports: ['websocket'],
+      reconnection: true,
+    })
+
+    const socket = socketRef.current
+
+    // CONNECTED
+    socket.on('connect', () => addLog(`[SOCKET_CONNECTED] ${socket.id}`))
+
+    // DISCONNECT
+    socket.on('disconnect', (reason) => addLog(`[SOCKET_DISCONNECTED] ${reason}`))
+
+    // --------------------- MEETING EVENTS ---------------------
+    socket.on('meeting:created', (data: any) => {
+      addLog(`[MEETING_CREATED] ${data.meetingId} participants: ${data.participants.length}`)
+      setParticipants(data.participants)
+    })
+
+    socket.on('meeting:joined', (data: any) => {
+      addLog(`[MEETING_JOINED] ${data.existingParticipants.length} existing participants`)
+      setParticipants(data.existingParticipants)
+
+      data.existingParticipants.forEach((p: string) => createPeerConnection(p, true))
+    })
+
+    socket.on('meeting:participant-joined', (data: any) => {
+      addLog(`[PARTICIPANT_JOINED] ${data.userId}`)
+      setParticipants(data.participants)
+      createPeerConnection(data.userId, true)
+    })
+
+    socket.on('meeting:participant-left', (data: any) => {
+      addLog(`[PARTICIPANT_LEFT] ${data.userId}`)
+      setParticipants(data.participants)
+
+      const pc = peerConnectionsRef.current.get(data.userId)
+      if (pc) pc.close()
+      peerConnectionsRef.current.delete(data.userId)
+
+      setRemoteStreams((prev) => {
+        const newStreams = new Map(prev)
+        newStreams.delete(data.userId)
+        return newStreams
+      })
+    })
+
+    // --------------------- WEBRTC SIGNALING ---------------------
+    socket.on('webrtc:offer', async ({ fromUserId, offer }) => {
+      addLog(`[OFFER_RECEIVED] from ${fromUserId}`)
+      await handleOffer(fromUserId, offer)
+    })
+
+    socket.on('webrtc:answer', async ({ fromUserId, answer }) => {
+      addLog(`[ANSWER_RECEIVED] from ${fromUserId}`)
+      const pc = peerConnectionsRef.current.get(fromUserId)
+      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer))
+    })
+
+    socket.on('webrtc:ice-candidate', async ({ fromUserId, candidate }) => {
+      const pc = peerConnectionsRef.current.get(fromUserId)
+      if (pc && pc.remoteDescription) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate))
+          addLog(`[ICE_ADDED] from ${fromUserId}`)
+        } catch (err: any) {
+          addLog(`[ICE_ERROR] ${err.message}`)
+        }
+      }
+    })
+
+    return () => {
+      addLog('Cleaning up socket...')
+      socket.disconnect()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // --------------------- FETCH ROOM INFO ---------------------
+  useEffect(() => {
+    const fetchRoomInfo = async () => {
+      try {
+        addLog('Fetching room info...')
+        const res = await api.post(`/booking/${bookingId}/video/generate`, {
+          userType: userType.toUpperCase(),
+        })
+
+        const { roomId: fetchedRoomId, booking } = res.data?.data
+        setRoomId(fetchedRoomId)
+        setBookingStatus(booking.status)
+
+        addLog(`RoomId: ${fetchedRoomId}, Booking status: ${booking.status}`)
+
+        if (booking.status === 'CANCELLED' || booking.status === 'COMPLETED') {
+          addLog('Booking not active, redirecting...')
+          router.push('/appointments')
+          return
+        }
+
+        if (booking.status === 'IN_PROGRESS') {
+          addLog('Auto-joining call...')
+          await startCall(fetchedRoomId)
+        }
+
+        setIsLoading(false)
+      } catch (err: any) {
+        addLog(`[FETCH_ROOM_ERROR] ${err.message}`)
+        setIsLoading(false)
+      }
+    }
+
+    fetchRoomInfo()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // --------------------- LOCAL STREAM ---------------------
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream
+      addLog('Local video attached')
+    }
+  }, [localStream])
+
+  // --------------------- CREATE PEER ---------------------
+  const createPeerConnection = async (userId: string, isOfferer: boolean) => {
+    if (!localStream) {
+      addLog('Cannot create peer: no local stream yet')
+      return
+    }
+
+    if (peerConnectionsRef.current.has(userId)) {
+      addLog(`Peer already exists for ${userId}`)
+      return
+    }
+
+    const pc = new RTCPeerConnection(iceServers)
+    peerConnectionsRef.current.set(userId, pc)
+    addLog(`PeerConnection created for ${userId}`)
+
+    localStream.getTracks().forEach((track) => pc.addTrack(track, localStream))
+
+    pc.ontrack = (event) => {
+      const remoteStream = event.streams[0]
+      if (!remoteStream) return
+
+      setRemoteStreams((prev) => {
+        const newStreams = new Map(prev)
+        newStreams.set(userId, remoteStream)
+        return newStreams
+      })
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current?.emit('webrtc:ice-candidate', {
+          meetingId: roomId,
+          targetUserId: userId,
+          candidate: event.candidate,
+        })
+      }
+    }
+
+    if (isOfferer) {
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true })
+      await pc.setLocalDescription(offer)
+      socketRef.current?.emit('webrtc:offer', {
+        meetingId: roomId,
+        targetUserId: userId,
+        offer,
+      })
+    }
+  }
+
+  // --------------------- HANDLE OFFER ---------------------
+  const handleOffer = async (fromUserId: string, offer: RTCSessionDescriptionInit) => {
+    let pc = peerConnectionsRef.current.get(fromUserId)
+    if (!pc) {
+      pc = new RTCPeerConnection(iceServers)
+      peerConnectionsRef.current.set(fromUserId, pc)
+
+      if (localStream) {
+        localStream.getTracks().forEach((track) => pc!.addTrack(track, localStream!))
+      }
+
+      pc.ontrack = (event) => {
+        const remoteStream = event.streams[0]
+        if (!remoteStream) return
+
+        setRemoteStreams((prev) => {
+          const newStreams = new Map(prev)
+          newStreams.set(fromUserId, remoteStream)
+          return newStreams
+        })
+      }
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socketRef.current?.emit('webrtc:ice-candidate', {
+            meetingId: roomId,
+            targetUserId: fromUserId,
+            candidate: event.candidate,
+          })
+        }
+      }
+    }
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer))
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    socketRef.current?.emit('webrtc:answer', {
+      meetingId: roomId,
+      targetUserId: fromUserId,
+      answer,
+    })
+  }
+
+  // --------------------- START CALL ---------------------
+  const startCall = async (targetRoomId?: string) => {
+    try {
+      const roomToJoin = targetRoomId || roomId
+      if (!roomToJoin) throw new Error('No roomId')
+
+      addLog('Requesting camera/microphone...')
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      setLocalStream(stream)
+      setIsCallActive(true)
+
+      if (bookingStatus !== 'IN_PROGRESS') {
+        try {
+          await api.post(`/booking/${bookingId}/video/start`, { userType: userType.toUpperCase() })
+          setBookingStatus('IN_PROGRESS')
+        } catch (err: any) {
+          addLog(`[API_START_CALL_ERROR] ${err.message}`)
+        }
+      }
+
+      socketRef.current?.emit('meeting:join', {
+        meetingId: roomToJoin,
+        userId: socketRef.current?.id,
+      })
+      addLog(`[JOIN_ROOM_EMIT] ${roomToJoin}`)
+    } catch (err: any) {
+      addLog(`[START_CALL_ERROR] ${err.message}`)
+    }
+  }
+
+  const toggleMute = () => {
+    if (!localStream) return
+    const audioTrack = localStream.getAudioTracks()[0]
+    audioTrack.enabled = !audioTrack.enabled
+    setIsMuted(!audioTrack.enabled)
+  }
+
+  const toggleVideo = () => {
+    if (!localStream) return
+    const videoTrack = localStream.getVideoTracks()[0]
+    videoTrack.enabled = !videoTrack.enabled
+    setIsVideoOff(!videoTrack.enabled)
+  }
+
+  // --------------------- RENDER ---------------------
+  if (isLoading)
+    return (
+      <div className="video-call-container">
+        <div className="loading">Loading meeting room...</div>
+      </div>
+    )
+
+  return (
+    <div className="video-call-container">
+      <div className="debug-panel">
+        <div className="debug-header">🐛 Debug Log</div>
+        {debugLogs.map((log, i) => (
+          <div key={i} className="debug-log">
+            {log}
+          </div>
+        ))}
+        <div className="debug-stats">
+          Room: {roomId} | Status: {bookingStatus} | Remote Streams: {remoteStreams.size} |
+          Participants: {participants.length}
+        </div>
+      </div>
+
+      <div className="video-grid">
+        {Array.from(remoteStreams.entries()).map(([userId, stream]) => (
+          <div key={userId} className="video-box">
+            <video
+              ref={(el) => {
+                if (el) el.srcObject = stream
+                remoteVideosRef.current.set(userId, el)
+              }}
+              autoPlay
+              playsInline
+              className="video"
+            />
+            <div className="video-label">Remote User</div>
+          </div>
+        ))}
+
+        {isCallActive && (
+          <div className={remoteStreams.size > 0 ? 'video-box-mini' : 'video-box'}>
+            <video ref={localVideoRef} autoPlay playsInline muted className="video" />
+            <div className="video-label">You ({userType})</div>
+          </div>
+        )}
+      </div>
+
+      <div className="controls">
+        {!isCallActive ? (
+          <button onClick={() => startCall()} className="btn btn-start">
+            Start Call
+          </button>
+        ) : (
+          <>
+            <button
+              onClick={toggleMute}
+              className={`btn ${isMuted ? 'btn-danger' : 'btn-secondary'}`}
+            >
+              {isMuted ? '🔇' : '🎤'}
+            </button>
+            <button
+              onClick={toggleVideo}
+              className={`btn ${isVideoOff ? 'btn-danger' : 'btn-secondary'}`}
+            >
+              {isVideoOff ? '📹' : '📷'}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export default VideoCallWithBooking_Two
