@@ -1,9 +1,9 @@
-'use client';
+"use client";
 
-import React, { useState, useEffect } from 'react';
-import Link from 'next/link';
-import { useTheme } from 'next-themes';
-import { Sun, Moon, Twitter, Instagram, Linkedin } from 'lucide-react';
+import React, { useState, useEffect } from "react";
+import Link from "next/link";
+import { useTheme } from "next-themes";
+import { Sun, Moon, Twitter, Instagram, Linkedin } from "lucide-react";
 
 export default function Footer() {
   const [mounted, setMounted] = useState(false);
@@ -26,18 +26,25 @@ export default function Footer() {
               height={40}
               className="h-8 w-auto object-contain"
             /> */}
-            <span className="font-black uppercase text-lg">Babcock Health</span>
+            <span className="font-black uppercase text-lg">
+              Yabatech Health
+            </span>
           </Link>
           <p className="max-w-xs text-muted-foreground/80">
-            Your trusted healthcare platform connecting doctors, patients, and clinics seamlessly.
+            Your trusted healthcare platform connecting doctors, patients, and
+            clinics seamlessly.
           </p>
           {/* Theme toggle */}
           {mounted && (
             <button
-              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
               className="mt-2 flex items-center gap-2 text-muted-foreground hover:text-foreground transition"
             >
-              {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              {theme === "dark" ? (
+                <Sun className="h-4 w-4" />
+              ) : (
+                <Moon className="h-4 w-4" />
+              )}
               <span className="text-sm">Toggle Theme</span>
             </button>
           )}
@@ -79,7 +86,7 @@ export default function Footer() {
 
       {/* Bottom copyright */}
       <div className="border-t mt-6 pt-4 text-center text-muted-foreground/70 text-xs">
-        &copy; {new Date().getFullYear()} Babcock Health. All rights reserved.
+        &copy; {new Date().getFullYear()} Yabatech Health. All rights reserved.
       </div>
     </footer>
   );

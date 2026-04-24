@@ -1,25 +1,25 @@
-import type { Metadata } from 'next'
-import 'react-toastify/dist/ReactToastify.css'
-import './globals.css'
-import { ThemeProvider } from '@/components/theme-provider'
-import StoreProvider from './_providers/storeProvider'
-import { ToastContainer } from 'react-toastify'
-import QueryProvider from './_providers/QueryProvider'
-import { Toaster } from 'sonner'
-import Header from '@/components/header'
-import { AuthProvider } from '@/context/auth-context'
-import Footer from '@/components/footer'
-import Chatbot from '@/components/chatbot'
+import type { Metadata } from "next";
+import "react-toastify/dist/ReactToastify.css";
+import "./globals.css";
+import { ThemeProvider } from "@/components/theme-provider";
+import StoreProvider from "./_providers/storeProvider";
+import { ToastContainer } from "react-toastify";
+import QueryProvider from "./_providers/QueryProvider";
+import { Toaster } from "sonner";
+import Header from "@/components/header";
+import { AuthProvider } from "@/context/auth-context";
+import Footer from "@/components/footer";
+import Chatbot from "@/components/chatbot";
 
 export const metadata: Metadata = {
-  title: 'Babcock Healthcare System',
-  description: 'Healthcare bookings app.',
-}
+  title: "Yabatech Healthcare System",
+  description: "Healthcare bookings app.",
+};
 
 export default function RootLayout({
   children,
 }: Readonly<{
-  children: React.ReactNode
+  children: React.ReactNode;
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
@@ -42,5 +42,5 @@ export default function RootLayout({
         </AuthProvider>
       </body>
     </html>
-  )
+  );
 }
